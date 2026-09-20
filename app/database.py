@@ -1,6 +1,6 @@
 """SQLite 持久化层。
 
-四张表：
+五张表：
 - chains：链条头信息与链尾缓存（tail_hash / current_holder 是事件表的可信投影）
 - events：链上的全部事件，序号 0 为创世记录（文件摘要 + 首位持有人），
   序号 >=1 为移交记录。
@@ -20,12 +20,24 @@
   （token_digest，与 offer_id 做域分隔），不存明文；decision 为 NULL 表示
   尚未表态，同一见证人至多表态一次（令牌本身即一次性）。拒绝/过期/链尾推进
   等终止状态为派生状态，不额外改写邀约行。
+- chain_seals：交接链的争议封存。只保存「绑定 seal_id 做域分隔」的一次性
+  解封码 SHA-256 摘要（release_code_digest），明文绝不落库；封存不追加任何
+  哈希链事件。status 仅存储 active / released 两种：released 为凭解封码提前
+  解封后的终态；封存行一旦写入，其过期时刻 expires_at 不再变化，故「过期」
+  不在写路径上落库，而由读/写事务按 now > expires_at 实时派生为 expired
+  （与邀约过期同样是派生状态）。创建新封存前，同链所有已过期的 active 旧封存
+  会在同一立即事务内物化为 expired，随后再插入新行；部分唯一索引
+  uq_active_seal_per_chain 保证「同一链同时至多一个 active 存储行」，与立即
+  事务共同兜底：封存创建与直接移交、邀约创建/替换/确认竞争时只有一方成功。
 
 防分叉保障：
 1. 所有写操作在进程内串行锁 + SQLite `BEGIN IMMEDIATE` 中完成，
    追加前校验链尾哈希，校验与插入在同一事务内原子完成；
 2. (chain_id, seq) 唯一、(chain_id, nonce) 唯一，由数据库兜底，
-   任何竞争写入都不可能产生第二条分叉链或重放随机数。
+   任何竞争写入都不可能产生第二条分叉链或重放随机数；
+3. chain_seals 上的部分唯一索引 uq_active_seal_per_chain
+   （WHERE status = 'active'）兜底「同一链同时至多一个生效封存」，
+   封存创建与移交/邀约写操作并发时必有一方失败。
 
 建表语句全部为 CREATE ... IF NOT EXISTS，init_db() 可重复执行，
 对已有数据库文件只做增量补表/补列/重建，不触碰存量数据。
@@ -126,6 +138,36 @@ CREATE TABLE IF NOT EXISTS offer_witnesses (
 
 CREATE INDEX IF NOT EXISTS idx_offer_witnesses_offer
     ON offer_witnesses(offer_id, witness_index);
+
+CREATE TABLE IF NOT EXISTS chain_seals (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    seal_id               TEXT NOT NULL UNIQUE,
+    chain_id              TEXT NOT NULL,
+    tail_hash             TEXT NOT NULL,
+    reason                TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'active',
+    release_code_digest   TEXT NOT NULL,
+    expires_at            TEXT NOT NULL,
+    created_at            TEXT NOT NULL,
+    released_at           TEXT,
+    CHECK(status IN ('active', 'released', 'expired')),
+    -- released_at 仅属于 released 终态：active / expired 必须为 NULL，
+    -- released 必须非空（过期时刻由固定的 expires_at 表达，不另存时间戳）
+    CHECK((released_at IS NULL) = (status <> 'released')),
+    FOREIGN KEY(chain_id) REFERENCES chains(chain_id)
+);
+
+-- 自增 id 单调递增：created_at 仅精确到秒，同秒内多个封存（含解封后再封存）
+-- 一律以 id 判定先后，保证「最新封存」查询稳定。
+CREATE INDEX IF NOT EXISTS idx_chain_seals_chain
+    ON chain_seals(chain_id, id);
+
+-- 同一链同时至多一个「存储态 active」封存。过期 active 行会在创建新封存的
+-- 同一立即事务内先物化为 expired，因此该索引长期约束的就是当前生效封存；
+-- 它与 BEGIN IMMEDIATE 共同兜底并发创建（含跨进程），竞争插入必有一方失败。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_seal_per_chain
+    ON chain_seals(chain_id)
+    WHERE status = 'active';
 """
 
 # 旧表重建时必须具备的列；缺失列在搬数据时补 NULL（见 _migrate_offers_if_needed）

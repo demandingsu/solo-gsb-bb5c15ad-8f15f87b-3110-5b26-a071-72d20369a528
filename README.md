@@ -94,6 +94,41 @@
   5. **见证状态查询** `GET /offers/{offer_id}/witnesses`：返回各见证人的名称、
      序号、表态结果与同意/拒绝/待表态计数及派生邀约状态，**绝不返回令牌及其
      摘要**（`GET /offers/{offer_id}` 的邀约详情同样只给统计与表态结果）。
+- **争议封存（chain seal）**：交接链出现争议时，持有人可对整条链申请封存，
+  冻结期间所有「会推进哈希链或产生新邀约」的入口：
+  1. **创建封存** `POST /chains/{chain_id}/seals`：持有人携带**当前链尾**
+     `tail_hash`、争议原因 `reason`、有效期 `expires_in_seconds`（秒，上限
+     30 天）与一次性解封码 `release_code`。服务端**只保存「绑定 `seal_id`
+     做域分隔」的 SHA-256 解封码摘要**（`seal:<seal_id>:release-code:<code>`），
+     明文不落库；封存本身**不追加任何哈希链事件**，链条仍可完整校验。链尾不
+     匹配返回 **409**（`tail_mismatch`）；**同一链同时只能有一个生效封存**，
+     重复封存返回 **409**（`chain_seal_active`，由部分唯一索引
+     `uq_active_seal_per_chain` 与立即事务共同兜底）。
+  2. **封存生效期间的冻结语义**：直接移交 `POST /handovers`，以及邀约的
+     创建 `POST /offers`、替换 `POST /offers/{id}/replace`、确认
+     `POST /offers/{id}/confirm`，都在各自**现有 SQLite 立即事务内的任何写入
+     之前**检查封存，命中即返回 **409 `chain_on_hold`**，**不写入事件、不写入
+     或替换邀约**。封存创建与这些操作共用同一把写锁与 `BEGIN IMMEDIATE`
+     语义，并发时只有一方成功（封存先提交则操作被拒；操作先提交则链尾推进、
+     封存因 `tail_mismatch` 失败）。
+     （注：按需求范围，仅上述四类操作被冻结；邀约撤销与见证人表态不推进链、
+     不产生新邀约，不在冻结之列。）
+  3. **提前解封** `POST /seals/{seal_id}/release`：凭一次性解封码在同一立即
+     事务内把封存置为 `released` 并记录 `released_at`，解封同样**不动哈希链**，
+     解封后四类操作立即恢复。解封码错误返回 **403**
+     （`release_code_mismatch`）；封存不存在 **404**；重复解封 **409**
+     （`seal_already_released`）。
+  4. **过期自动失效**：封存有效期由创建时固定的 `expires_at` 决定，到期**无需
+     任何写操作**即自动失效——读写事务按当前时间实时派生 `expired` 状态，四类
+     操作随之自然恢复；之后可重新创建封存（创建时同链已过期的旧封存会在同一
+     事务内物化为 `expired` 终态）。对已过期封存调用解封返回 **409**
+     （`seal_expired`）。
+  5. **查询封存** `GET /seals/{seal_id}`（按封存 ID）与
+     `GET /chains/{chain_id}/seal`（某链最新封存）：返回
+     `active` / `released` / `expired` 状态、`reason`、锁定链尾 `tail_hash`
+     以及 `created_at` / `expires_at` / `released_at` 时间信息；**任何情况下
+     都不返回解封码及其摘要**。链条不存在返回 404；该链从未有过封存时链级
+     查询返回 **404**（`seal_not_found`）。
 - **完整性校验**：服务端从创世记录起逐条重算哈希、校验序号连续性与 `prev_hash`
   指针，并比对链尾缓存；校验结果给出 **首个断裂序号 `first_broken_seq`**。
 
@@ -146,12 +181,25 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET`  | `/offers/{offer_id}` | 查询单个邀约状态与 replaces / replaced_by 替换关系（pending / accepted / expired / rejected / terminated / cancelled / replaced） |
 | `GET`  | `/chains` | 列出全部链条 |
 | `GET`  | `/chains/{chain_id}` | 查询链条与全部事件 |
+| `POST` | `/chains/{chain_id}/seals` | 创建争议封存（当前链尾 + 原因 + 有效期 + 一次性解封码；同链仅一个生效封存，重复 409） |
+| `POST` | `/seals/{seal_id}/release` | 凭一次性解封码提前解封（错码 403；重复解封/已过期 409；不动哈希链） |
+| `GET`  | `/seals/{seal_id}` | 按封存 ID 查询状态（active / released / expired，不含解封码摘要） |
+| `GET`  | `/chains/{chain_id}/seal` | 查询某条链最新的封存（无封存 404 seal_not_found） |
 | `GET`  | `/chains/{chain_id}/verify` | 完整性校验，指出首个断裂序号 |
 | `GET`  | `/health` | 健康检查 |
 
 错误响应统一为：`{"error": "<code>", "detail": "<说明>"}`。状态码约定：
-**409** —— `tail_mismatch`（链尾不匹配/已推进，邀约派生状态为 `terminated`）、
-`nonce_replay`（随机数重放）、`offer_expired`（邀约已过期）、
+**409** —— `tail_mismatch`（链尾不匹配/已推进，邀约派生状态为 `terminated`；
+创建封存时链尾不匹配同样返回此码）、
+`nonce_replay`（随机数重放）、
+`chain_on_hold`（链条处于争议封存生效期：直接移交与邀约的创建、替换、确认
+一律被冻结，不写事件或新邀约）、
+`chain_seal_active`（该链已有生效封存，同一链同时只能有一个；并发封存落败
+也返回此码）、
+`seal_already_released`（封存已提前解封，不能重复解封）、
+`seal_expired`（封存已过有效期自动失效，无需再解封）、
+`seal_not_active`（解封在竞争中落败时的兜底错误码）、
+`offer_expired`（邀约已过期）、
 `offer_already_accepted`（邀约重复确认 / 已接受后继续表态）、
 `offer_replaced`（邀约已被原子替换：旧确认/旧令牌对原邀约不再有效）、
 `offer_rejected`（已有见证人拒绝，邀约终止）、
@@ -165,8 +213,10 @@ terminated / cancelled / replaced，或创建时未提供撤销码的旧邀约�
 cancelled / replaced / rejected / expired / terminated，或创建时未提供撤销码
 的旧邀约；替换与确认/撤销/表态竞争落败也返回此码，整体回滚不产生半替换）；
 **403** —— `code_mismatch`（确认码错误）、`token_mismatch`（见证人令牌错误）、
-`cancel_code_mismatch`（撤销码错误：撤销或原子替换时原撤销码不匹配）；
-**404** —— 链条、邀约不存在，或对无见证邀约查询 `witness_mode_not_found`。
+`cancel_code_mismatch`（撤销码错误：撤销或原子替换时原撤销码不匹配）、
+`release_code_mismatch`（封存解封码错误）；
+**404** —— 链条、邀约、封存不存在，或对无见证邀约查询 `witness_mode_not_found`、
+对从未有过封存的链查询最新封存 `seal_not_found`。
 
 ## 使用示例
 
@@ -374,6 +424,60 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
 #               {"witness_index":2,"name":"erin","decision":null,"decided_at":null}]}
 ```
 
+### 争议封存示例
+
+```bash
+# 1) alice（当前持有人）发现争议，携带当前链尾创建封存：
+#    原因、有效期 24 小时、一次性解封码（服务端只存绑定 seal_id 的摘要）
+curl -s -X POST http://localhost:8000/chains/ab12.../seals \
+  -H 'Content-Type: application/json' \
+  -d '{"tail_hash":"<当前链尾>","reason":"文件完整性存疑，等待争议处理",
+       "expires_in_seconds":86400,"release_code":"unseal-2026-001"}'
+# 201 响应（封存不追加任何链上事件）：
+# {"seal_id":"3af2...","chain_id":"ab12...","status":"active",
+#  "reason":"文件完整性存疑，等待争议处理","tail_hash":"<当前链尾>",
+#  "created_at":"2026-09-20T03:00:00+00:00",
+#  "expires_at":"2026-09-21T03:00:00+00:00","released_at":null}
+
+# 2) 同一链同时只能有一个生效封存 -> 409 chain_seal_active
+curl -i -X POST http://localhost:8000/chains/ab12.../seals \
+  -H 'Content-Type: application/json' \
+  -d '{"tail_hash":"<当前链尾>","reason":"再次封存",
+       "expires_in_seconds":60,"release_code":"other"}'
+
+# 3) 生效期间四类操作一律 409 chain_on_hold，且不写事件/新邀约：
+#    直接移交
+curl -i -X POST http://localhost:8000/handovers \
+  -H 'Content-Type: application/json' \
+  -d '{"chain_id":"ab12...","tail_hash":"<当前链尾>","receiver":"bob","nonce":"n-9"}'
+#    创建邀约 / 替换邀约 / 确认邀约 同样返回 409 chain_on_hold
+curl -i -X POST http://localhost:8000/offers \
+  -H 'Content-Type: application/json' \
+  -d '{"chain_id":"ab12...","tail_hash":"<当前链尾>","receiver":"bob",
+       "expires_in_seconds":3600,"confirmation_code":"s3cret"}'
+
+# 4) 查询封存（按 ID 或按链查最新）：只返回状态/原因/时间，绝不返回解封码摘要
+curl -s http://localhost:8000/seals/3af2...
+curl -s http://localhost:8000/chains/ab12.../seal
+# {"seal_id":"3af2...","status":"active","reason":"...",
+#  "created_at":"...","expires_at":"...","released_at":null, ...}
+
+# 5) 争议处理完毕，持有人凭一次性解封码提前解封
+curl -s -X POST http://localhost:8000/seals/3af2.../release \
+  -H 'Content-Type: application/json' \
+  -d '{"release_code":"unseal-2026-001"}'
+# {"seal_id":"3af2...","status":"released",
+#  "released_at":"2026-09-20T05:30:00+00:00", ...}
+
+# 6) 错误情形：
+#    解封码错误   -> 403 release_code_mismatch（封存保持 active）
+#    重复解封     -> 409 seal_already_released
+#    封存已过期   -> 409 seal_expired（到期已自动失效，无需解封）
+# 过期后无需任何操作，四类操作自动恢复，且可重新创建封存。
+
+# 7) 链尾不是最新 -> 409 tail_mismatch（仅当前持有人可凭最新链尾封存）
+```
+
 校验响应示例（正常）：
 
 ```json
@@ -417,10 +521,16 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
    CHECK 保证二者与 `replaced_at`、`status='replaced'` 一致），不可能出现只建了
    新邀约却没终结旧邀约的悬挂行。见证人表设有 `UNIQUE(offer_id, witness_index)`
    与 `UNIQUE(offer_id, token_digest)`，且表态以「行已存在 decision」判定一次性，
-   重复使用令牌不可能产生第二条表态。
+   重复使用令牌不可能产生第二条表态。**争议封存由 `chain_seals` 表上的部分唯一
+   索引 `uq_active_seal_per_chain`（`WHERE status = 'active'`）兜底同一链至多一个
+   生效封存；直接移交、邀约创建/替换/确认都在各自立即事务的任何写入之前检查生效
+   封存并返回 409 `chain_on_hold`，与封存创建共用同一把写锁——封存先提交则操作
+   全部落败且不写事件/新邀约，操作先提交则封存因链尾推进（`tail_mismatch`）落败，
+   并发双方至多一个成功；封存与解封均不追加哈希链事件，CHECK 约束还保证
+   `released_at` 仅随 `released` 终态出现。**
 3. WAL 日志模式 + busy timeout，兼顾读写并发与单写入者语义。
 4. 数据库初始化（`init_db`）全部使用 `CREATE ... IF NOT EXISTS`，可重复执行；
-   对已有数据文件只做增量补表（含 `offers`、`offer_witnesses` 表）；对旧版
+   对已有数据文件只做增量补表（含 `offers`、`offer_witnesses`、`chain_seals` 表）；对旧版
    `offers` 表按 SQLite 官方「建新表 → 搬数据 → 改名」流程一次性就地重建，
    增补 `witness_threshold`（旧无见证邀约为 NULL）、`cancel_code_digest` /
    `cancelled_at`（旧邀约撤销码为 NULL，即不可撤销/不可替换）以及
@@ -434,7 +544,7 @@ curl -s http://localhost:8000/offers/9d1a.../witnesses
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
-│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 查询 / 校验）
+│   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 撤销 / 原子替换 / 见证 / 争议封存 / 查询 / 校验）
 │   ├── database.py    # SQLite 连接、建表与旧 offers 表重建迁移、串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
 │   ├── schemas.py     # Pydantic 请求/响应模型

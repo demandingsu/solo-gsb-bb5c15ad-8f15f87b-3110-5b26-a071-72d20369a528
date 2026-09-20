@@ -32,6 +32,32 @@
    回滚，绝不产生半替换；
 5. 过期、重复确认、链尾已推进、已撤销或已被替换均返回 409 且不写事件。
 
+争议封存（chain seal）
+----------------------
+持有人可对存在争议的交接链申请封存（POST /chains/{chain_id}/seals）：
+携带创建时的当前链尾 tail_hash、争议原因 reason、有效期 expires_in_seconds
+与一次性解封码 release_code。
+- 解封码只保存「seal:<seal_id>:release-code:<code>」的 SHA-256 摘要，
+  摘要域绑定 seal_id 且与确认码/撤销码/见证令牌分属不同域，明文绝不落库；
+  任何查询响应都不返回该摘要。
+- 同一链同时只能有一个生效封存：部分唯一索引 uq_active_seal_per_chain 与
+  BEGIN IMMEDIATE 立即事务共同保证，重复封存返回 409 chain_seal_active。
+- 封存生效期间（存储态 active 且未过期），直接移交（POST /handovers）以及
+  邀约的创建（POST /offers）、替换（POST /offers/{id}/replace）、确认
+  （POST /offers/{id}/confirm）都在各自现有的 SQLite 立即事务内最前置校验
+  封存并返回 409 chain_on_hold，且绝不写入事件或新邀约；封存创建与这些
+  操作共用同一把写锁与同一立即事务语义，并发时只有一方成功。
+- 封存行不写任何哈希链事件，不影响链条可验证性。
+- 提前解封（POST /seals/{seal_id}/release）：凭一次性解封码在立即事务内把
+  封存置为 released；解封码错误返回 403 release_code_mismatch；封存已解封
+  返回 409 seal_already_released；已过期（派生）返回 409 seal_expired。
+- 过期自动失效：封存有效期由创建时固定的 expires_at 决定，过期不需任何写
+  操作——读写事务按当前时间实时派生 expired；创建新封存时，同链已过期的
+  active 旧封存在同一事务内物化为 expired，随后再插入新封存。
+- 查询（GET /seals/{seal_id} 与 GET /chains/{chain_id}/seal）返回
+  active / released / expired 三种对外状态、原因与创建/到期/解封时间信息，
+  绝不暴露解封码摘要。
+
 撤销码规则
 ----------
 - 创建邀约时 cancellation_code 可选：省略则邀约不可撤销（与旧邀约一致）；
@@ -129,6 +155,16 @@ def _cancel_code_digest(offer_id: str, code: str) -> str:
     绝不落库明文。
     """
     return digest_hex(f"offer:{offer_id}:cancel-code:{code}")
+
+
+def _release_code_digest(seal_id: str, code: str) -> str:
+    """封存一次性解封码的存储摘要。
+
+    摘要域绑定 seal_id（同一解封码字符串在不同封存间不可复用），且与确认码
+    （offer-code:）、见证令牌（:witness-token:）、撤销码（:cancel-code:）
+    分属不同域。绝不落库明文。
+    """
+    return digest_hex(f"seal:{seal_id}:release-code:{code}")
 
 
 def _genesis_payload(file_hash: str, holder: str) -> dict[str, Any]:
@@ -284,7 +320,8 @@ def append_handover(
     """追加一次移交。
 
     冲突（409）情形：链条不存在 -> 404；链尾哈希不匹配（过期/竞争请求）；
-    随机数在该链内重放。任何冲突都不会写入数据，链条不会分叉。
+    随机数在该链内重放；链条处于争议封存生效期（chain_on_hold）。
+    任何冲突都不会写入数据，链条不会分叉。
     """
     with write_tx() as conn:
         chain = conn.execute(
@@ -292,6 +329,10 @@ def append_handover(
         ).fetchone()
         if chain is None:
             raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+        # 封存门禁：最前置校验。封存生效期间直接移交一律 409 chain_on_hold，
+        # 与封存创建共用立即事务，竞争时只有一方成功，绝不写入事件。
+        _raise_if_chain_on_hold(conn, chain_id)
 
         if chain["tail_hash"] != tail_hash:
             raise ChainError(
@@ -547,6 +588,9 @@ def create_offer(
         if chain is None:
             raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
 
+        # 封存门禁：生效期间不得创建新邀约，与封存创建互斥。
+        _raise_if_chain_on_hold(conn, chain_id)
+
         if chain["tail_hash"] != tail_hash:
             raise ChainError(
                 409,
@@ -585,6 +629,10 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
         ).fetchone()
         if offer is None:
             raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+
+        # 封存门禁（最前置，先于确认码比对）：封存生效期间确认一律 409
+        # chain_on_hold 且不写事件，也不据此泄露确认码是否正确。
+        _raise_if_chain_on_hold(conn, offer["chain_id"])
 
         if offer["status"] == "cancelled":
             raise ChainError(
@@ -792,6 +840,10 @@ def replace_offer(
         ).fetchone()
         if offer is None:
             raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+
+        # 封存门禁（最前置，先于原撤销码比对）：封存生效期间既不能写入新邀约，
+        # 也不能终结旧邀约，一律 409 chain_on_hold，与封存创建互斥。
+        _raise_if_chain_on_hold(conn, offer["chain_id"])
 
         # 非 pending 一律 409 offer_not_replaceable，且在验码之前判定 ——
         # 不具备替换条件时不泄露原撤销码是否匹配。
@@ -1177,3 +1229,256 @@ def verify_chain(chain_id: str) -> dict[str, Any]:
         "recomputed_tail_hash": recomputed_tail,
         "stored_tail_hash": chain["tail_hash"],
     }
+
+
+# ---------------------------------------------------------------------------
+# 争议封存
+# ---------------------------------------------------------------------------
+
+_SEAL_TTL_MAX = 30 * 24 * 3600  # 封存有效期上限：30 天
+
+
+def _seal_status(seal: sqlite3.Row, now: Optional[datetime] = None) -> str:
+    """封存对外状态：released 为存储终态；active 行过期则派生 expired。
+
+    封存行的 expires_at 在创建时固定且不再变化，因此「过期」无需任何写操作，
+    读写时按当前时间实时派生（与邀约过期同样处理）。
+    """
+    if seal["status"] == "released":
+        return "released"
+    now = now or _now_dt()
+    if now > _parse_ts(seal["expires_at"]):
+        return "expired"
+    return "active"
+
+
+def _raise_if_chain_on_hold(
+    conn: sqlite3.Connection,
+    chain_id: str,
+    now: Optional[datetime] = None,
+) -> None:
+    """在已开启的写事务内检查封存门禁：存在生效封存即抛 409 chain_on_hold。
+
+    直接移交、邀约创建/替换/确认在各自的立即事务内、任何写入之前调用本函数，
+    与封存创建共用同一把写锁与 BEGIN IMMEDIATE 语义：封存创建先提交则后续操作
+    看到 active 行而失败；操作先提交则封存创建看到推进后的链尾（链尾不匹配）
+    或直接在唯一索引上失败——竞争双方至多一个成功。
+    """
+    now = now or _now_dt()
+    seal = conn.execute(
+        """SELECT * FROM chain_seals
+           WHERE chain_id = ? AND status = 'active'
+           ORDER BY id DESC
+           LIMIT 1""",
+        (chain_id,),
+    ).fetchone()
+    if seal is not None and now <= _parse_ts(seal["expires_at"]):
+        raise ChainError(
+            409,
+            "chain_on_hold",
+            "链条处于争议封存生效期：直接移交与邀约的创建、替换、确认均被冻结，"
+            "请由持有人凭解封码提前解封或等待封存到期",
+        )
+
+
+def _seal_to_dict(seal: sqlite3.Row, now: Optional[datetime] = None) -> dict[str, Any]:
+    """封存行 -> 对外字典：只给原因与时间信息，绝不返回解封码摘要。"""
+    return {
+        "seal_id": seal["seal_id"],
+        "chain_id": seal["chain_id"],
+        "status": _seal_status(seal, now),
+        "reason": seal["reason"],
+        "tail_hash": seal["tail_hash"],
+        "created_at": seal["created_at"],
+        "expires_at": seal["expires_at"],
+        "released_at": seal["released_at"],
+    }
+
+
+def create_seal(
+    chain_id: str,
+    tail_hash: str,
+    reason: str,
+    expires_in_seconds: int,
+    release_code: str,
+) -> dict[str, Any]:
+    """持有人对交接链创建争议封存。
+
+    在同一个 SQLite 立即事务（BEGIN IMMEDIATE）内完成：链条存在 -> 当前无
+    生效封存（含已过期但尚未物化的 active 行）-> 携带的 tail_hash 必须仍是
+    当前链尾（持有人身份由链尾持有语义隐式校验）-> 把同链已过期 active 旧封存
+    物化为 expired -> 插入新封存行（只存绑定 seal_id 做域分隔的解封码摘要）。
+    任一校验失败整体回滚，不写任何数据，也不触碰哈希链。
+
+    链条不存在返回 404；已有生效封存返回 409 chain_seal_active；链尾不匹配
+    返回 409 tail_mismatch；并发插入由部分唯一索引 uq_active_seal_per_chain
+    兜底，落败方同样得到 409 chain_seal_active。
+    """
+    seal_id = uuid.uuid4().hex
+    now = _now_dt()
+    created_at = now.isoformat(timespec="seconds")
+    expires_at = (now + timedelta(seconds=expires_in_seconds)).isoformat(
+        timespec="seconds"
+    )
+
+    with write_tx() as conn:
+        chain = conn.execute(
+            "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+        active = conn.execute(
+            """SELECT * FROM chain_seals
+               WHERE chain_id = ? AND status = 'active'
+               ORDER BY id DESC
+               LIMIT 1""",
+            (chain_id,),
+        ).fetchone()
+        if active is not None and now <= _parse_ts(active["expires_at"]):
+            raise ChainError(
+                409,
+                "chain_seal_active",
+                "该链已存在生效封存，同一链同时只能有一个生效封存；"
+                "请先凭解封码提前解封或等待其到期",
+            )
+
+        if chain["tail_hash"] != tail_hash:
+            raise ChainError(
+                409,
+                "tail_mismatch",
+                "链尾哈希不匹配：仅当前持有人可凭最新链尾创建封存，"
+                "请获取最新链尾后重试",
+            )
+
+        # 旧 active 封存均已过期（上面的生效封存检查已排除未过期情形）：在同一
+        # 事务内物化为 expired（released_at 保持 NULL——过期时刻即固定不变的
+        # expires_at），随后插入新行。expires_at 本身不再变化，这里仅落库派生
+        # 终态，使部分唯一索引只约束当前生效封存。
+        conn.execute(
+            """UPDATE chain_seals
+               SET status = 'expired'
+               WHERE chain_id = ? AND status = 'active'""",
+            (chain_id,),
+        )
+
+        try:
+            conn.execute(
+                """INSERT INTO chain_seals
+                   (seal_id, chain_id, tail_hash, reason, status,
+                    release_code_digest, expires_at, created_at, released_at)
+                   VALUES (?, ?, ?, ?, 'active', ?, ?, ?, NULL)""",
+                (
+                    seal_id,
+                    chain_id,
+                    tail_hash,
+                    reason,
+                    _release_code_digest(seal_id, release_code),
+                    expires_at,
+                    created_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # 仅当并发事务抢先插入了生效封存（部分唯一索引）时发生。
+            raise ChainError(
+                409,
+                "chain_seal_active",
+                f"封存创建冲突：该链已有并发生效封存: {exc}",
+            ) from exc
+
+        seal = conn.execute(
+            "SELECT * FROM chain_seals WHERE seal_id = ?", (seal_id,)
+        ).fetchone()
+
+    return _seal_to_dict(seal, now)
+
+
+def release_seal(seal_id: str, release_code: str) -> dict[str, Any]:
+    """凭一次性解封码提前解封。
+
+    在同一个 SQLite 立即事务内完成：封存存在 -> 未被提前解封 -> 未过期 ->
+    解封码摘要匹配 -> 置为 released 并记录 released_at，整体原子提交。解封不
+    追加任何哈希链事件。解封码错误返回 403 release_code_mismatch（在确认封存
+    仍 active 且未过期之后才验码，避免对终态/过期封存泄露码是否匹配）；封存
+    不存在返回 404；已解封返回 409 seal_already_released；已过期返回
+    409 seal_expired（过期自动失效，无需也不能再解封）。
+    """
+    with write_tx() as conn:
+        seal = conn.execute(
+            "SELECT * FROM chain_seals WHERE seal_id = ?", (seal_id,)
+        ).fetchone()
+        if seal is None:
+            raise ChainError(404, "not_found", f"封存不存在: {seal_id}")
+
+        if seal["status"] == "released":
+            raise ChainError(
+                409, "seal_already_released", "封存已提前解封，不能重复解封"
+            )
+
+        now = _now_dt()
+        if now > _parse_ts(seal["expires_at"]):
+            raise ChainError(
+                409,
+                "seal_expired",
+                "封存已过有效期并自动失效，无需解封",
+            )
+
+        if seal["release_code_digest"] != _release_code_digest(
+            seal_id, release_code
+        ):
+            raise ChainError(403, "release_code_mismatch", "解封码不正确")
+
+        released_at = _now()
+        cursor = conn.execute(
+            """UPDATE chain_seals
+               SET status = 'released', released_at = ?
+               WHERE seal_id = ? AND status = 'active'""",
+            (released_at, seal_id),
+        )
+        if cursor.rowcount != 1:
+            # 立即事务内不会被插队；影响行数异常只可能是状态已被改写，绝不写入。
+            raise ChainError(
+                409,
+                "seal_not_active",
+                "封存已离开 active 状态（竞争终止），解封未生效",
+            )
+
+        seal = conn.execute(
+            "SELECT * FROM chain_seals WHERE seal_id = ?", (seal_id,)
+        ).fetchone()
+
+    return _seal_to_dict(seal, now)
+
+
+def get_seal(seal_id: str) -> dict[str, Any]:
+    """按封存 ID 查询状态（不含解封码摘要）；封存不存在返回 404。"""
+    with read_tx() as conn:
+        seal = conn.execute(
+            "SELECT * FROM chain_seals WHERE seal_id = ?", (seal_id,)
+        ).fetchone()
+        if seal is None:
+            raise ChainError(404, "not_found", f"封存不存在: {seal_id}")
+    return _seal_to_dict(seal)
+
+
+def get_latest_seal(chain_id: str) -> dict[str, Any]:
+    """查询某条链最新的一个封存（不含解封码摘要）。
+
+    链条不存在返回 404；该链从未有过封存返回 404 seal_not_found。
+    """
+    with read_tx() as conn:
+        chain = conn.execute(
+            "SELECT chain_id FROM chains WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+        seal = conn.execute(
+            """SELECT * FROM chain_seals
+               WHERE chain_id = ?
+               ORDER BY id DESC
+               LIMIT 1""",
+            (chain_id,),
+        ).fetchone()
+        if seal is None:
+            raise ChainError(404, "seal_not_found", "该链尚无封存记录")
+    return _seal_to_dict(seal)

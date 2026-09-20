@@ -22,6 +22,9 @@ from .schemas import (
     OfferOut,
     OfferReplaceRequest,
     OfferStatusOut,
+    SealCreateRequest,
+    SealOut,
+    SealReleaseRequest,
     VerifyResult,
     WitnessDecisionRequest,
     WitnessDecisionResult,
@@ -34,11 +37,15 @@ from .service import (
     confirm_offer,
     create_chain,
     create_offer,
+    create_seal,
     get_chain,
+    get_latest_seal,
     get_offer,
+    get_seal,
     get_witness_status,
     list_chains,
     record_witness_decision,
+    release_seal,
     replace_offer,
     verify_chain,
 )
@@ -54,7 +61,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -296,6 +303,84 @@ def api_get_chain(chain_id: str) -> ChainOut:
 )
 def api_verify_chain(chain_id: str) -> VerifyResult:
     return VerifyResult(**verify_chain(chain_id))
+
+
+@app.post(
+    "/chains/{chain_id}/seals",
+    response_model=SealOut,
+    status_code=201,
+    tags=["seals"],
+    summary="对存在争议的交接链创建封存",
+    description=(
+        "持有人携带当前链尾 tail_hash、争议原因 reason、有效期 "
+        "expires_in_seconds（秒，上限 30 天）与一次性解封码 release_code 创建封存。"
+        "服务端只保存「绑定 seal_id 做域分隔」的 SHA-256 解封码摘要，明文绝不落库，"
+        "且封存不追加任何哈希链事件。同一链同时只能有一个生效封存：重复封存返回 "
+        "409 chain_seal_active；链尾不匹配返回 409 tail_mismatch；链条不存在返回 404。"
+        "封存生效期间，直接移交（POST /handovers）以及邀约的创建、替换、确认都在"
+        "各自现有 SQLite 立即事务内返回 409 chain_on_hold，且不写事件或新邀约；"
+        "封存创建与这些操作并发时由立即事务与部分唯一索引保证只有一方成功。"
+    ),
+)
+def api_create_seal(chain_id: str, req: SealCreateRequest) -> SealOut:
+    return SealOut(
+        **create_seal(
+            chain_id,
+            req.tail_hash,
+            req.reason,
+            req.expires_in_seconds,
+            req.release_code,
+        )
+    )
+
+
+@app.post(
+    "/seals/{seal_id}/release",
+    response_model=SealOut,
+    tags=["seals"],
+    summary="凭一次性解封码提前解封",
+    description=(
+        "持有人（或任何持有解封码的一方）凭 seal_id 与创建时提交的 "
+        "release_code 提前解封。服务端在同一 SQLite 立即事务内校验封存仍 active、"
+        "未过期且解封码摘要匹配，然后将封存置为 released 并记录 released_at，"
+        "解封不追加任何链上事件。解封码错误返回 403 release_code_mismatch；封存不"
+        "存在返回 404；已解封返回 409 seal_already_released；已过期返回 409 "
+        "seal_expired（过期自动失效，无需再解封）。任何响应都不返回解封码摘要。"
+    ),
+)
+def api_release_seal(seal_id: str, req: SealReleaseRequest) -> SealOut:
+    return SealOut(**release_seal(seal_id, req.release_code))
+
+
+@app.get(
+    "/seals/{seal_id}",
+    response_model=SealOut,
+    tags=["seals"],
+    summary="按封存 ID 查询封存状态",
+    description=(
+        "返回封存状态 active（生效中）/ released（已提前解封）/ expired（已过期"
+        "自动失效，派生状态），以及原因 reason、锁定链尾 tail_hash 与创建时刻 "
+        "created_at、到期时刻 expires_at、解封时刻 released_at；封存不存在返回 404。"
+        "任何情况下都不返回解封码及其摘要。"
+    ),
+)
+def api_get_seal(seal_id: str) -> SealOut:
+    return SealOut(**get_seal(seal_id))
+
+
+@app.get(
+    "/chains/{chain_id}/seal",
+    response_model=SealOut,
+    tags=["seals"],
+    summary="查询某条链最新的封存",
+    description=(
+        "返回该链最近一次封存的 active / released / expired 状态、原因与时间信息，"
+        "绝不返回解封码摘要。链条不存在返回 404；该链从未有过封存返回 404 "
+        "seal_not_found。"
+    ),
+)
+def api_get_latest_seal(chain_id: str) -> SealOut:
+    return SealOut(**get_latest_seal(chain_id))
 
 
 def main() -> None:

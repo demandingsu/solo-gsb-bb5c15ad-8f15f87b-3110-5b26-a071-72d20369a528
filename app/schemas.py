@@ -12,6 +12,8 @@ _NONCE_MAX = 256
 _CODE_MAX = 128
 _TOKEN_MAX = 256
 _OFFER_TTL_MAX = 7 * 24 * 3600  # 邀约有效期上限：7 天
+_SEAL_TTL_MAX = 30 * 24 * 3600  # 争议封存有效期上限：30 天
+_REASON_MAX = 1000
 _WITNESS_MIN = 2
 _WITNESS_MAX = 5
 
@@ -575,6 +577,98 @@ class OfferConfirmResult(BaseModel):
     canonical: str
     tail_hash: str
     current_holder: str
+
+
+class SealCreateRequest(BaseModel):
+    tail_hash: str = Field(
+        ...,
+        description=(
+            "创建封存时锁定的当前链尾哈希：必须仍是最新链尾，"
+            "链尾不匹配返回 409 tail_mismatch"
+        ),
+    )
+    reason: str = Field(
+        ...,
+        description=(
+            "争议/封存原因（必填，最多 1000 字符）；查询时原样返回，便于审计"
+        ),
+    )
+    expires_in_seconds: int = Field(
+        ...,
+        description=(
+            "封存有效期（秒），自创建时刻起算；到期自动失效，无需写操作，"
+            f"上限 {_SEAL_TTL_MAX} 秒（30 天）"
+        ),
+        ge=1,
+        le=_SEAL_TTL_MAX,
+    )
+    release_code: str = Field(
+        ...,
+        description=(
+            "一次性解封码：服务端只保存「绑定 seal_id 做域分隔」的 SHA-256 摘要，"
+            "明文绝不落库，凭此码可调用 POST /seals/{seal_id}/release 提前解封"
+        ),
+    )
+
+    @field_validator("tail_hash")
+    @classmethod
+    def _check_tail_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "tail_hash")
+
+    @field_validator("reason")
+    @classmethod
+    def _check_reason(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("reason 不能为空（须说明争议/封存原因）")
+        if len(v) > _REASON_MAX:
+            raise ValueError(f"reason 长度不能超过 {_REASON_MAX}")
+        return v
+
+    @field_validator("release_code")
+    @classmethod
+    def _check_release_code(cls, v: str) -> str:
+        return _validate_code(v, "release_code")
+
+
+class SealReleaseRequest(BaseModel):
+    release_code: str = Field(
+        ...,
+        description=(
+            "创建封存时提交的一次性解封码（服务端只存绑定 seal_id 的摘要）；"
+            "错误返回 403 release_code_mismatch"
+        ),
+    )
+
+    @field_validator("release_code")
+    @classmethod
+    def _check_release_code(cls, v: str) -> str:
+        return _validate_code(v, "release_code")
+
+
+class SealOut(BaseModel):
+    seal_id: str
+    chain_id: str
+    status: Literal["active", "released", "expired"] = Field(
+        ...,
+        description=(
+            "封存状态：active（生效中）/ released（已凭解封码提前解封，存储终态）/ "
+            "expired（已过 expires_at 自动失效，派生状态）"
+        ),
+    )
+    reason: str = Field(..., description="创建封存时提交的争议/封存原因")
+    tail_hash: str = Field(
+        ...,
+        description="创建封存时锁定的链尾哈希；封存不改动哈希链，它通常仍是当前链尾",
+    )
+    created_at: str = Field(..., description="封存创建时刻（UTC ISO-8601）")
+    expires_at: str = Field(
+        ..., description="封存有效期截止时刻（UTC ISO-8601）；过后状态派生为 expired"
+    )
+    released_at: Optional[str] = Field(
+        default=None,
+        description="凭解封码提前解封的时刻（UTC ISO-8601）；未解封为 null",
+    )
 
 
 class HealthOut(BaseModel):
