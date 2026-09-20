@@ -1,6 +1,6 @@
 """SQLite 持久化层。
 
-四张表：
+五张表：
 - chains：链条头信息与链尾缓存（tail_hash / current_holder 是事件表的可信投影）
 - events：链上的全部事件，序号 0 为创世记录（文件摘要 + 首位持有人），
   序号 >=1 为移交记录。
@@ -20,6 +20,12 @@
   （token_digest，与 offer_id 做域分隔），不存明文；decision 为 NULL 表示
   尚未表态，同一见证人至多表态一次（令牌本身即一次性）。拒绝/过期/链尾推进
   等终止状态为派生状态，不额外改写邀约行。
+- chain_holds：争议封存。只保存一次性解封码「绑定 hold_id 做域分隔」的
+  SHA-256 摘要（release_code_digest），不存明文；tail_hash 记录封存创建时
+  锁定的链尾。status 取值 active / released / expired：expired 通常按
+  expires_at 派生（过期自动失效），创建新封存时会把已过期但仍标记 active
+  的封存物化为 expired 存储状态，两种来源对外一致；部分唯一索引
+  idx_chain_holds_one_active 兜底保证同一链同时至多一个生效封存。
 
 防分叉保障：
 1. 所有写操作在进程内串行锁 + SQLite `BEGIN IMMEDIATE` 中完成，
@@ -126,6 +132,31 @@ CREATE TABLE IF NOT EXISTS offer_witnesses (
 
 CREATE INDEX IF NOT EXISTS idx_offer_witnesses_offer
     ON offer_witnesses(offer_id, witness_index);
+
+CREATE TABLE IF NOT EXISTS chain_holds (
+    hold_id             TEXT PRIMARY KEY,
+    chain_id            TEXT NOT NULL,
+    tail_hash           TEXT NOT NULL,
+    reason              TEXT NOT NULL,
+    release_code_digest TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'active',
+    created_at          TEXT NOT NULL,
+    expires_at          TEXT NOT NULL,
+    released_at         TEXT,
+    CHECK(status IN ('active', 'released', 'expired')),
+    -- released_at 与 released 状态成对出现（expired 不记 released_at）
+    CHECK((status = 'released') = (released_at IS NOT NULL)),
+    FOREIGN KEY(chain_id) REFERENCES chains(chain_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_holds_chain
+    ON chain_holds(chain_id, created_at);
+
+-- 同一链同时只能有一个生效封存：部分唯一索引兜底。已过期的生效封存在
+-- 创建新封存的同一事务内被物化为 expired（释放索引槽位），因此该索引
+-- 不会阻挡「过期后再封存」，只拦截真正的并发双封存。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chain_holds_one_active
+    ON chain_holds(chain_id) WHERE status = 'active';
 """
 
 # 旧表重建时必须具备的列；缺失列在搬数据时补 NULL（见 _migrate_offers_if_needed）
@@ -222,6 +253,7 @@ def init_db() -> None:
     撤销码为 NULL，即不可撤销）以及 replaces / replaced_by / replaced_at
     （旧邀约之间无替换关系），并把 status 的 CHECK 扩展为 pending /
     accepted / cancelled / replaced；存量邀约数据原样搬运，行为兼容。
+    chain_holds 为纯新增表，CREATE IF NOT EXISTS 直接建出，无需迁移。
     """
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _get_conn() as conn:

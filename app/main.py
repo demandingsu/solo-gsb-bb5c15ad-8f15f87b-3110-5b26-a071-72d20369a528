@@ -14,6 +14,9 @@ from .schemas import (
     HandoverRequest,
     HandoverResult,
     HealthOut,
+    HoldCreateRequest,
+    HoldOut,
+    HoldReleaseRequest,
     OfferCancelRequest,
     OfferCancelResult,
     OfferConfirmRequest,
@@ -33,12 +36,16 @@ from .service import (
     cancel_offer,
     confirm_offer,
     create_chain,
+    create_hold,
     create_offer,
     get_chain,
+    get_chain_hold,
+    get_hold,
     get_offer,
     get_witness_status,
     list_chains,
     record_witness_decision,
+    release_hold,
     replace_offer,
     verify_chain,
 )
@@ -54,7 +61,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="文件交接留痕服务",
     description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -93,6 +100,7 @@ def api_create_chain(req: CreateChainRequest) -> ChainOut:
     description=(
         "必须携带当前链尾哈希 tail_hash、接收方 receiver 与一次性随机数 nonce。"
         "交出方由服务端按当前持有人确定。链尾不匹配或随机数重放返回 409，不产生分叉。"
+        "链条处于生效争议封存中时返回 409 chain_on_hold，不写入事件。"
     ),
 )
 def api_handover(req: HandoverRequest) -> HandoverResult:
@@ -116,6 +124,7 @@ def api_handover(req: HandoverRequest) -> HandoverResult:
         "的兼容旧行为邀约。"
         "可选提交 2～5 名见证人及通过阈值 witness_threshold：每位见证人获得一个"
         "独立一次性令牌（仅在本响应中明文返回一次，服务端只存其 SHA-256 摘要）。"
+        "链条处于生效争议封存中时返回 409 chain_on_hold，不写入新邀约。"
     ),
 )
 def api_create_offer(req: OfferCreateRequest) -> OfferOut:
@@ -148,7 +157,8 @@ def api_create_offer(req: OfferCreateRequest) -> OfferOut:
         "接收方凭 offer_id 与一次性确认码确认。服务端在同一 SQLite 立即事务中校验"
         "邀约未过期、未使用、未撤销且链尾仍匹配；见证模式下还须无见证人拒绝且同意数达到"
         "阈值，然后才追加唯一移交事件并将邀约置为 accepted。过期、重复确认、"
-        "见证拒绝、同意数不足、链尾已推进、邀约已撤销或已被替换均返回 409，不写事件。"
+        "见证拒绝、同意数不足、链尾已推进、邀约已撤销或已被替换均返回 409，不写事件；"
+        "链条处于生效争议封存中时返回 409 chain_on_hold，同样不写事件。"
     ),
 )
 def api_confirm_offer(offer_id: str, req: OfferConfirmRequest) -> OfferConfirmResult:
@@ -190,7 +200,8 @@ def api_cancel_offer(offer_id: str, req: OfferCancelRequest) -> OfferCancelResul
         "任一校验失败整体回滚，绝不产生半替换。替换与确认、撤销、见证人表态"
         "互斥，竞争终态中至多一个成功。原撤销码错误返回 403 cancel_code_mismatch；"
         "非可替换状态（accepted / cancelled / replaced / expired / terminated / "
-        "rejected，或原邀约创建时未提供撤销码）返回 409 offer_not_replaceable。"
+        "rejected，或原邀约创建时未提供撤销码）返回 409 offer_not_replaceable；"
+        "链条处于生效争议封存中时返回 409 chain_on_hold，既不终结旧邀约也不创建新邀约。"
         "新邀约的确认码/撤销码/见证令牌全部重新生成与旧凭证互不通用；响应与"
         "详情接口只暴露 replaces/replaced_by 关系，不泄露任何凭证摘要。"
     ),
@@ -265,6 +276,78 @@ def api_get_witness_status(offer_id: str) -> WitnessStatusOut:
 )
 def api_get_offer(offer_id: str) -> OfferStatusOut:
     return OfferStatusOut(**get_offer(offer_id))
+
+
+@app.post(
+    "/holds",
+    response_model=HoldOut,
+    status_code=201,
+    tags=["holds"],
+    summary="创建争议封存（冻结链条）",
+    description=(
+        "持有人携带当前链尾 tail_hash、争议原因、有效期（秒）与一次性解封码"
+        "创建封存。服务端在同一个 SQLite 立即事务中校验链尾匹配且同一链无"
+        "其他生效封存（过期封存自动失效，并在该事务内物化释放槽位）；解封码"
+        "只保存绑定封存 ID 做域分隔的 SHA-256 摘要，明文不落库。封存生效"
+        "期间，直接移交与邀约的创建/替换/确认一律返回 409 chain_on_hold；"
+        "封存创建与这些操作并发时只有一方成功。"
+    ),
+)
+def api_create_hold(req: HoldCreateRequest) -> HoldOut:
+    return HoldOut(
+        **create_hold(
+            req.chain_id,
+            req.tail_hash,
+            req.reason,
+            req.expires_in_seconds,
+            req.release_code,
+        )
+    )
+
+
+@app.post(
+    "/holds/{hold_id}/release",
+    response_model=HoldOut,
+    tags=["holds"],
+    summary="凭一次性解封码提前解封",
+    description=(
+        "凭创建封存时设置的解封码提前解除封存。解封码错误返回 403 "
+        "release_code_mismatch；封存已解封或已过期（过期自动失效，无需解封）"
+        "返回 409 hold_not_releasable。解封只解除冻结，绝不改动哈希链与任何"
+        "邀约。响应不含解封码摘要。"
+    ),
+)
+def api_release_hold(hold_id: str, req: HoldReleaseRequest) -> HoldOut:
+    return HoldOut(**release_hold(hold_id, req.release_code))
+
+
+@app.get(
+    "/holds/{hold_id}",
+    response_model=HoldOut,
+    tags=["holds"],
+    summary="查询单个封存状态",
+    description=(
+        "返回封存状态（active / released / expired，过期为派生或物化状态）、"
+        "争议原因、锁定链尾与创建/过期/解封时间，绝不返回解封码摘要。"
+    ),
+)
+def api_get_hold(hold_id: str) -> HoldOut:
+    return HoldOut(**get_hold(hold_id))
+
+
+@app.get(
+    "/chains/{chain_id}/hold",
+    response_model=HoldOut,
+    tags=["holds"],
+    summary="查询链条当前（最近一次）封存状态",
+    description=(
+        "返回该链最近一次创建的封存及其状态（active / released / expired）；"
+        "同一链同时至多一个生效封存，因此生效中的封存即最近一次封存。"
+        "从未封存的链条返回 404 hold_not_found。绝不返回解封码摘要。"
+    ),
+)
+def api_get_chain_hold(chain_id: str) -> HoldOut:
+    return HoldOut(**get_chain_hold(chain_id))
 
 
 @app.get(

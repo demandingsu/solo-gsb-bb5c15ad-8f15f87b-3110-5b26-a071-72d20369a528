@@ -11,7 +11,9 @@ _NAME_MAX = 200
 _NONCE_MAX = 256
 _CODE_MAX = 128
 _TOKEN_MAX = 256
+_REASON_MAX = 500
 _OFFER_TTL_MAX = 7 * 24 * 3600  # 邀约有效期上限：7 天
+_HOLD_TTL_MAX = 7 * 24 * 3600  # 封存有效期上限：7 天
 _WITNESS_MIN = 2
 _WITNESS_MAX = 5
 
@@ -575,6 +577,80 @@ class OfferConfirmResult(BaseModel):
     canonical: str
     tail_hash: str
     current_holder: str
+
+
+class HoldCreateRequest(BaseModel):
+    chain_id: str = Field(..., description="交接链 ID")
+    tail_hash: str = Field(..., description="创建封存时锁定的当前链尾哈希")
+    reason: str = Field(..., description="争议原因（随封存记录，查询接口可见）")
+    expires_in_seconds: int = Field(
+        ...,
+        description="封存有效期（秒），自创建时刻起算，过期自动失效",
+        ge=1,
+        le=_HOLD_TTL_MAX,
+    )
+    release_code: str = Field(
+        ...,
+        description="一次性解封码，服务端只保存「绑定封存 ID 做域分隔」的 SHA-256 摘要",
+    )
+
+    @field_validator("chain_id")
+    @classmethod
+    def _check_chain_id(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("chain_id 不能为空")
+        return v
+
+    @field_validator("tail_hash")
+    @classmethod
+    def _check_tail_hash(cls, v: str) -> str:
+        return _validate_hex64(v, "tail_hash")
+
+    @field_validator("reason")
+    @classmethod
+    def _check_reason(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("reason 不能为空（争议原因）")
+        if len(v) > _REASON_MAX:
+            raise ValueError(f"reason 长度不能超过 {_REASON_MAX}")
+        return v
+
+    @field_validator("release_code")
+    @classmethod
+    def _check_release_code(cls, v: str) -> str:
+        return _validate_code(v, "release_code")
+
+
+class HoldReleaseRequest(BaseModel):
+    release_code: str = Field(
+        ..., description="创建封存时设置的一次性解封码（服务端只存其摘要）"
+    )
+
+    @field_validator("release_code")
+    @classmethod
+    def _check_release_code(cls, v: str) -> str:
+        return _validate_code(v, "release_code")
+
+
+class HoldOut(BaseModel):
+    hold_id: str
+    chain_id: str
+    status: str = Field(
+        ...,
+        description=(
+            "active（生效中）/ released（已凭解封码解封）/ "
+            "expired（已过期自动失效）"
+        ),
+    )
+    reason: str = Field(..., description="创建封存时登记的争议原因")
+    tail_hash: str = Field(..., description="封存创建时锁定的链尾哈希")
+    created_at: str
+    expires_at: str
+    released_at: Optional[str] = Field(
+        None, description="解封时刻；未解封为 null（过期失效不记该字段）"
+    )
 
 
 class HealthOut(BaseModel):

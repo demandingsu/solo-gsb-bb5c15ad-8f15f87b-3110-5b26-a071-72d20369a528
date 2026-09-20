@@ -73,6 +73,30 @@
    全部通过才追加移交事件。拒绝（offer_rejected）、见证数不足
    （witness_threshold_not_met）、过期、链尾推进均为 409 且不写事件；
 5. 无见证邀约（不提交见证人）行为与上述普通邀约完全一致，向后兼容。
+
+争议封存
+--------
+1. 持有人携带当前 tail_hash、争议原因、有效期（秒）与一次性解封码调用
+   POST /holds 创建封存：服务端在同一个 SQLite 立即事务中校验链尾匹配、
+   同一链无其他生效封存（已过期但仍标记 active 的封存在该事务内物化为
+   expired，释放「唯一生效封存」槽位），然后写入 status='active' 的封存；
+   解封码只保存「hold:<hold_id>:release-code:<code>」的 SHA-256 摘要，
+   摘要域绑定 hold_id 且与确认码、撤销码、见证令牌分属不同域，明文不落库；
+2. 封存生效期间，直接移交（POST /handovers）以及邀约的创建、替换、确认
+   一律在各自的 SQLite 立即事务内返回 409 chain_on_hold，不写任何事件或
+   新邀约；邀约的撤销与见证人表态不改动哈希链，不受封存影响；
+3. 封存创建与上述操作共用同一把写锁与立即事务语义：与直接移交/邀约确认
+   经链尾锁互斥（对方先推进链尾则封存创建 409 tail_mismatch，封存先生效
+   则对方 409 chain_on_hold），与邀约创建/替换经生效封存检查互斥，
+   竞争中至多一方生效；部分唯一索引 idx_chain_holds_one_active 兜底，
+   同一链绝不可能同时存在两个生效封存；
+4. 凭解封码调用 POST /holds/{hold_id}/release 可提前解封：错码返回
+   403 release_code_mismatch；已解封或已过期返回 409
+   hold_not_releasable（过期封存自动失效，无需解封）；解封只解除冻结，
+   绝不改动哈希链与任何邀约；
+5. 查询（GET /holds/{hold_id} 或 GET /chains/{chain_id}/hold）返回
+   active / released / expired 状态与原因、创建/过期/解封时间，
+   绝不返回解封码摘要。
 """
 from __future__ import annotations
 
@@ -129,6 +153,16 @@ def _cancel_code_digest(offer_id: str, code: str) -> str:
     绝不落库明文。
     """
     return digest_hex(f"offer:{offer_id}:cancel-code:{code}")
+
+
+def _release_code_digest(hold_id: str, code: str) -> str:
+    """一次性解封码的存储摘要。
+
+    摘要域绑定 hold_id（同一解封码字符串在不同封存间不可复用），且与
+    确认码摘要（offer-code:）、撤销码摘要（:cancel-code:）、见证令牌摘要
+    （:witness-token:）分属不同域。绝不落库明文。
+    """
+    return digest_hex(f"hold:{hold_id}:release-code:{code}")
 
 
 def _genesis_payload(file_hash: str, holder: str) -> dict[str, Any]:
@@ -283,7 +317,8 @@ def append_handover(
 ) -> dict[str, Any]:
     """追加一次移交。
 
-    冲突（409）情形：链条不存在 -> 404；链尾哈希不匹配（过期/竞争请求）；
+    冲突（409）情形：链条不存在 -> 404；链条处于生效封存中 ->
+    chain_on_hold（不写事件）；链尾哈希不匹配（过期/竞争请求）；
     随机数在该链内重放。任何冲突都不会写入数据，链条不会分叉。
     """
     with write_tx() as conn:
@@ -292,6 +327,9 @@ def append_handover(
         ).fetchone()
         if chain is None:
             raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+        # 生效封存冻结整条链：同一立即事务内检查，绝不写入事件。
+        _raise_if_chain_on_hold_tx(conn, chain_id)
 
         if chain["tail_hash"] != tail_hash:
             raise ChainError(
@@ -539,6 +577,8 @@ def create_offer(
     witnesses 非空时创建见证确认模式邀约（2～5 名见证人 + 通过阈值），
     每位见证人的独立一次性令牌同样只保存摘要；创建响应中一次性返回
     令牌明文，由发起方线下分发，此后服务端不再展示。
+
+    链条处于生效封存中时返回 409 chain_on_hold，不写入新邀约。
     """
     with write_tx() as conn:
         chain = conn.execute(
@@ -546,6 +586,9 @@ def create_offer(
         ).fetchone()
         if chain is None:
             raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+        # 生效封存冻结整条链：同一立即事务内检查，绝不写入新邀约。
+        _raise_if_chain_on_hold_tx(conn, chain_id)
 
         if chain["tail_hash"] != tail_hash:
             raise ChainError(
@@ -577,7 +620,8 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
     （见证模式）无拒绝且同意数达到阈值，然后追加移交事件、推进链头
     并将邀约置为 accepted，整体原子提交。
     过期、重复确认、见证拒绝、同意数不足、链尾已推进、已撤销或已被替换均
-    返回 409 且整体回滚，不写任何事件。
+    返回 409 且整体回滚，不写任何事件；链条处于生效封存中返回 409
+    chain_on_hold，同样不写事件。
     """
     with write_tx() as conn:
         offer = conn.execute(
@@ -614,6 +658,9 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
         ).fetchone()
         if chain is None:  # 外键约束下理论上不可达
             raise ChainError(404, "not_found", f"链条不存在: {offer['chain_id']}")
+
+        # 生效封存冻结整条链：同一立即事务内检查，绝不追加事件。
+        _raise_if_chain_on_hold_tx(conn, offer["chain_id"])
 
         if chain["tail_hash"] != offer["tail_hash"]:
             raise ChainError(
@@ -776,7 +823,8 @@ def replace_offer(
     拒绝、锁定链尾仍是当前链尾，且创建时提供过撤销码。任一不满足（含邀约
     已 accepted / cancelled / replaced / rejected / expired / terminated，
     以及创建时未提供撤销码的旧邀约）返回 409 offer_not_replaceable，且不改
-    写任何数据；原撤销码错误返回 403 cancel_code_mismatch。
+    写任何数据；原撤销码错误返回 403 cancel_code_mismatch。链条处于生效
+    封存中时返回 409 chain_on_hold，既不终结旧邀约也不创建新邀约。
 
     通过校验后，先在事务内创建锁定同一链尾的新邀约（新接收方、新有效期、
     新确认码摘要，以及可选的新撤销码摘要与全新见证配置；replaces 指向旧
@@ -816,6 +864,10 @@ def replace_offer(
         ).fetchone()
         if chain is None:  # 外键约束下理论上不可达
             raise ChainError(404, "not_found", f"链条不存在: {offer['chain_id']}")
+
+        # 生效封存冻结整条链：同一立即事务内检查，绝不产生半替换。
+        _raise_if_chain_on_hold_tx(conn, offer["chain_id"])
+
         if chain["tail_hash"] != offer["tail_hash"]:
             raise ChainError(
                 409,
@@ -989,6 +1041,266 @@ def record_witness_decision(
         "rejected_count": rejected,
         "pending_count": pending,
     }
+
+
+def _active_hold_tx(
+    conn: sqlite3.Connection, chain_id: str, now: Optional[datetime] = None
+) -> Optional[sqlite3.Row]:
+    """返回该链当前生效中的封存行（存储 active 且未过期），无则 None。
+
+    过期封存自动失效：存储状态仍为 active 但已过 expires_at 的封存视为
+    无效（派生 expired），此处只读不物化；物化只发生在创建新封存的事务里。
+    部分唯一索引 idx_chain_holds_one_active 保证至多返回一行。
+    """
+    row = conn.execute(
+        "SELECT * FROM chain_holds WHERE chain_id = ? AND status = 'active'",
+        (chain_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    now = now or _now_dt()
+    if now > _parse_ts(row["expires_at"]):
+        return None
+    return row
+
+
+def _raise_if_chain_on_hold_tx(conn: sqlite3.Connection, chain_id: str) -> None:
+    """链条处于生效封存中则抛出 409 chain_on_hold。
+
+    必须在写事务（BEGIN IMMEDIATE）内调用：与封存创建共用同一把写锁，
+    检查与后续写入原子完成，不存在「检查时未封存、写入时已封存」的窗口。
+    """
+    hold = _active_hold_tx(conn, chain_id)
+    if hold is not None:
+        raise ChainError(
+            409,
+            "chain_on_hold",
+            "链条处于争议封存中"
+            f"（hold_id={hold['hold_id']}，原因：{hold['reason']}，"
+            f"有效期至 {hold['expires_at']}），解封或封存过期前"
+            "禁止直接移交及邀约的创建、替换、确认",
+        )
+
+
+def _derived_hold_status(hold: sqlite3.Row, now: Optional[datetime] = None) -> str:
+    """封存对外状态：released / expired 优先，其次 active。
+
+    存储状态为 active / released / expired；expired 通常按 expires_at 派生
+    （生效封存超过有效期即自动失效），创建新封存时会把已过期但仍标记
+    active 的封存物化为 expired 存储状态，两种来源对外完全一致。
+    """
+    if hold["status"] == "released":
+        return "released"
+    if hold["status"] == "expired":
+        return "expired"
+    now = now or _now_dt()
+    if now > _parse_ts(hold["expires_at"]):
+        return "expired"
+    return "active"
+
+
+def _hold_to_dict(
+    hold: sqlite3.Row, now: Optional[datetime] = None
+) -> dict[str, Any]:
+    """封存行 -> 对外字典（任何情况下都不返回解封码摘要）。"""
+    return {
+        "hold_id": hold["hold_id"],
+        "chain_id": hold["chain_id"],
+        "status": _derived_hold_status(hold, now),
+        "reason": hold["reason"],
+        "tail_hash": hold["tail_hash"],
+        "created_at": hold["created_at"],
+        "expires_at": hold["expires_at"],
+        "released_at": hold["released_at"],
+    }
+
+
+def create_hold(
+    chain_id: str,
+    tail_hash: str,
+    reason: str,
+    expires_in_seconds: int,
+    release_code: str,
+) -> dict[str, Any]:
+    """持有人对链条创建争议封存，冻结直接移交与邀约的创建/替换/确认。
+
+    所有校验与写入在同一个 SQLite 立即事务（BEGIN IMMEDIATE）中完成：
+    校验链条存在、tail_hash 仍是当前链尾、同一链无其他生效封存（已过期
+    但仍标记 active 的封存在本事务内物化为 expired，释放「唯一生效封存」
+    槽位），然后写入 status='active' 的封存行。解封码只保存绑定 hold_id
+    做域分隔的 SHA-256 摘要，明文不落库。
+
+    与直接移交、邀约确认经链尾锁互斥：对方先在事务内推进链尾，则本创建
+    因 tail_mismatch 失败；本创建先提交，则对方因 chain_on_hold 失败，
+    竞争中至多一方生效。部分唯一索引 idx_chain_holds_one_active 是最终
+    防线，任何竞争都不可能让同一链出现两个生效封存。
+    """
+    with write_tx() as conn:
+        chain = conn.execute(
+            "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+
+        if chain["tail_hash"] != tail_hash:
+            raise ChainError(
+                409,
+                "tail_mismatch",
+                "链尾哈希不匹配：链条已被其他移交推进，请获取最新链尾后再创建封存",
+            )
+
+        now = _now_dt()
+        existing = conn.execute(
+            "SELECT * FROM chain_holds WHERE chain_id = ? AND status = 'active'",
+            (chain_id,),
+        ).fetchone()
+        if existing is not None:
+            if now > _parse_ts(existing["expires_at"]):
+                # 过期自动失效：物化为 expired，释放「唯一生效封存」索引槽位
+                conn.execute(
+                    "UPDATE chain_holds SET status = 'expired' WHERE hold_id = ?",
+                    (existing["hold_id"],),
+                )
+            else:
+                raise ChainError(
+                    409,
+                    "hold_already_active",
+                    "该链已存在生效中的封存"
+                    f"（hold_id={existing['hold_id']}，有效期至 "
+                    f"{existing['expires_at']}），同一链同时只能有一个生效封存",
+                )
+
+        hold_id = uuid.uuid4().hex
+        created_at = now.isoformat(timespec="seconds")
+        expires_at = (now + timedelta(seconds=expires_in_seconds)).isoformat(
+            timespec="seconds"
+        )
+        try:
+            conn.execute(
+                """INSERT INTO chain_holds
+                   (hold_id, chain_id, tail_hash, reason,
+                    release_code_digest, status, created_at, expires_at,
+                    released_at)
+                   VALUES (?, ?, ?, ?, ?, 'active', ?, ?, NULL)""",
+                (
+                    hold_id,
+                    chain_id,
+                    tail_hash,
+                    reason,
+                    _release_code_digest(hold_id, release_code),
+                    created_at,
+                    expires_at,
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            # 唯一生效封存索引兜底：并发下绝不允许第二个生效封存
+            raise ChainError(
+                409,
+                "hold_already_active",
+                "该链已存在生效中的封存（并发冲突），同一链同时只能有一个生效封存",
+            ) from exc
+
+        hold = conn.execute(
+            "SELECT * FROM chain_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+
+    return _hold_to_dict(hold)
+
+
+def release_hold(hold_id: str, release_code: str) -> dict[str, Any]:
+    """凭一次性解封码提前解封，解除链条冻结（绝不改动哈希链与邀约）。
+
+    所有校验与写入在同一个 SQLite 立即事务（BEGIN IMMEDIATE）中完成：
+    封存仍 active 且未过期（已 released / 已过期一律 409
+    hold_not_releasable，且在验码之前判定 —— 不具备解封条件时不泄露
+    解封码是否匹配），解封码摘要不匹配返回 403 release_code_mismatch；
+    通过后置为 released，并以 UPDATE ... WHERE status='active' 的影响
+    行数兜底，竞争落败整体回滚。错码、重复解封、过期解封都不写任何数据。
+    """
+    with write_tx() as conn:
+        hold = conn.execute(
+            "SELECT * FROM chain_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+        if hold is None:
+            raise ChainError(404, "hold_not_found", f"封存不存在: {hold_id}")
+
+        if hold["status"] == "released":
+            raise ChainError(
+                409, "hold_not_releasable", "封存已解封，不能重复解封"
+            )
+
+        if hold["status"] == "expired" or _now_dt() > _parse_ts(
+            hold["expires_at"]
+        ):
+            raise ChainError(
+                409,
+                "hold_not_releasable",
+                "封存已过期自动失效，无需解封",
+            )
+
+        if hold["release_code_digest"] != _release_code_digest(
+            hold_id, release_code
+        ):
+            raise ChainError(403, "release_code_mismatch", "解封码不正确")
+
+        released_at = _now()
+        # WHERE 条件再兜底一次：本事务内竞态被写锁排除，影响行数不为 1
+        # 只可能意味着封存已被其他终态占据，此时绝不写入。
+        cursor = conn.execute(
+            """UPDATE chain_holds
+               SET status = 'released', released_at = ?
+               WHERE hold_id = ? AND status = 'active'""",
+            (released_at, hold_id),
+        )
+        if cursor.rowcount != 1:
+            raise ChainError(
+                409,
+                "hold_not_releasable",
+                "封存已离开 active 状态（竞争终态），解封未生效",
+            )
+
+        hold = conn.execute(
+            "SELECT * FROM chain_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+
+    return _hold_to_dict(hold)
+
+
+def get_hold(hold_id: str) -> dict[str, Any]:
+    """查询单个封存状态（active / released / expired），不返回解封码摘要。"""
+    with read_tx() as conn:
+        hold = conn.execute(
+            "SELECT * FROM chain_holds WHERE hold_id = ?", (hold_id,)
+        ).fetchone()
+    if hold is None:
+        raise ChainError(404, "hold_not_found", f"封存不存在: {hold_id}")
+    return _hold_to_dict(hold)
+
+
+def get_chain_hold(chain_id: str) -> dict[str, Any]:
+    """查询链条最近一次创建的封存状态；从未封存的链条返回 404。
+
+    同一链同时至多一个生效封存，因此若存在生效封存，它必然就是最近一次
+    创建的封存。响应不含解封码摘要。
+    """
+    with read_tx() as conn:
+        chain = conn.execute(
+            "SELECT chain_id FROM chains WHERE chain_id = ?", (chain_id,)
+        ).fetchone()
+        if chain is None:
+            raise ChainError(404, "not_found", f"链条不存在: {chain_id}")
+        hold = conn.execute(
+            """SELECT * FROM chain_holds
+               WHERE chain_id = ?
+               ORDER BY created_at DESC, rowid DESC
+               LIMIT 1""",
+            (chain_id,),
+        ).fetchone()
+    if hold is None:
+        raise ChainError(
+            404, "hold_not_found", f"链条尚未有任何封存: {chain_id}"
+        )
+    return _hold_to_dict(hold)
 
 
 def get_offer(offer_id: str) -> dict[str, Any]:
